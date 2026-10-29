@@ -1,0 +1,537 @@
+import re
+from datetime import datetime, timedelta
+from typing import Optional, List, Tuple
+from app.schemas.agent import TravelIntent
+from app.models.flight import TravelClass
+
+from app.services.llm_service import GeminiLLMService
+
+CITY_MAP = {
+    "BANGALORE": "BLR",
+    "BANGLORE": "BLR",
+    "BENGALURU": "BLR",
+    "BENGLURU": "BLR",
+    "BLR": "BLR",
+    "CHENNAI": "MAA",
+    "CHENAI": "MAA",
+    "MADRAS": "MAA",
+    "MAA": "MAA",
+    "HYDERABAD": "HYD",
+    "HYDERBAD": "HYD",
+    "HYD": "HYD",
+    "MUMBAI": "BOM",
+    "BOMBAY": "BOM",
+    "BOM": "BOM",
+    "DELHI": "DEL",
+    "NEW DELHI": "DEL",
+    "NEWDELHI": "DEL",
+    "DELI": "DEL",
+    "DEL": "DEL"
+}
+
+WORD_TO_NUM = {
+    "ONE": 1, "TWO": 2, "THREE": 3, "FOUR": 4, "FIVE": 5,
+    "SIX": 6, "SEVEN": 7, "EIGHT": 8, "NINE": 9, "TEN": 10
+}
+
+class IntentAgent:
+    """
+    Dedicated Intent Agent.
+    Responsibility: Extract natural language travel requests into structured Pydantic TravelIntent.
+    Uses Google Gemini model if API key configured, with fallback to local NLP engine.
+    Strictly separated from execution/database tools.
+    """
+    def __init__(self):
+        self.gemini_service = GeminiLLMService()
+
+    def parse_intent(
+        self,
+        text: str,
+        active_step: Optional[str] = None,
+        active_cancellation_step: Optional[str] = None
+    ) -> TravelIntent:
+        upper_text = text.upper().strip()
+
+        # 1. Try Gemini LLM extraction if key configured
+        if self.gemini_service.is_configured():
+            gemini_intent = self.gemini_service.extract_intent_with_gemini(text)
+            if gemini_intent:
+                try:
+                    tc_raw = gemini_intent.get("travel_class")
+                    t_class = None
+                    if tc_raw == "BUSINESS":
+                        t_class = TravelClass.BUSINESS
+                    elif tc_raw == "PREMIUM_ECONOMY":
+                        t_class = TravelClass.PREMIUM_ECONOMY
+                    elif tc_raw == "ECONOMY":
+                        t_class = TravelClass.ECONOMY
+
+                    missing = []
+                    itype = gemini_intent.get("intent_type", "GENERAL_QUERY")
+                    src = gemini_intent.get("source")
+                    dst = gemini_intent.get("destination")
+                    flt_num = gemini_intent.get("flight_number")
+                    b_ref = gemini_intent.get("booking_reference")
+
+                    return TravelIntent(
+                        intent_type=itype,
+                        source=src,
+                        destination=dst,
+                        travel_date=gemini_intent.get("travel_date"),
+                        passenger_count=gemini_intent.get("passenger_count"),
+                        travel_class=t_class,
+                        booking_reference=b_ref,
+                        flight_number=flt_num,
+                        selected_seats=gemini_intent.get("selected_seats") or [],
+                        passengers_data=gemini_intent.get("passengers_data") or [],
+                        is_complete=bool(src and dst),
+                        missing_fields=missing
+                    )
+                except Exception:
+                    pass
+
+        # 2. Local Deterministic NLP parsing
+
+        # Check explicit cancellation confirmation actions
+        if any(w in upper_text for w in ["CONFIRM CANCELLATION", "YES, CANCEL IT", "YES CANCEL", "PROCEED WITH CANCELLATION", "CONFIRM CANCEL", "YES, CANCEL"]):
+            return TravelIntent(intent_type="CONFIRM_CANCELLATION", is_complete=True)
+
+        if any(w in upper_text for w in ["SHOULD I CANCEL", "WHAT HAPPENS IF I CANCEL", "MAYBE CANCEL", "SHOW CANCELLATION REFUND"]):
+            return TravelIntent(intent_type="CANCEL_INFO", is_complete=True)
+
+        # Booking reference / PNR extraction
+        ref_match = re.search(r"\b(BK-[A-Z0-9]{4,10})\b", upper_text)
+        pnr_prefix_match = re.search(r"\b(?:PNR|REFERENCE|REF|BOOKING\s*REF|BOOKING\s*REFERENCE)\s*:?\s*([A-Z0-9]{4,10})\b", upper_text)
+        
+        KEYWORDS = {
+            "BOOKING", "CANCEL", "FLIGHT", "SEARCH", "TICKET", "TICKETS", "SEAT", "SEATS", 
+            "PASSENGER", "PASSENGERS", "PEOPLE", "PERSON", "STATUS", "CHECK", "REFUND", "PLEASE", 
+            "MY", "TRIPS", "ECONOMY", "BUSINESS", "PREMIUM", "YES", "CONFIRM", "TOMORROW", "TODAY", 
+            "YESTERDAY", "DAY", "AFTER", "FIRST", "SECOND", "THIRD", "FOURTH", "OPTION", "CHOICE", 
+            "PROCEED", "PAYMENT", "CHEAPEST", "EARLIEST", "MORNING", "EVENING", "CHEAP", "LOWEST", 
+            "TAKE", "DETAILS", "CLASS", "TRAVEL", "MENU", "JANUARY", "JAN", "FEBRUARY", "FEB", 
+            "MARCH", "MAR", "APRIL", "APR", "MAY", "JUNE", "JUN", "JULY", "JUL", "AUGUST", "AUG", 
+            "SEPTEMBER", "SEP", "SEPT", "OCTOBER", "OCT", "NOVEMBER", "NOV", "DECEMBER", "DEC", 
+            "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY", "SUNDAY", "NEXT", 
+            "THIS", "WEEK", "MONTH", "YEAR"
+        }
+
+        if ref_match:
+            booking_ref = ref_match.group(1)
+        elif pnr_prefix_match and pnr_prefix_match.group(1) not in KEYWORDS and pnr_prefix_match.group(1) not in CITY_MAP:
+            booking_ref = pnr_prefix_match.group(1)
+        elif active_cancellation_step == "CANCELLATION_NEED_REFERENCE" or any(w in upper_text for w in ["CANCEL BOOKING", "CANCEL TICKET", "CHECK STATUS", "STATUS OF"]):
+            candidates = re.findall(r"\b[A-Z0-9]{5,10}\b", upper_text)
+            valid_candidates = [c for c in candidates if c not in CITY_MAP and c not in KEYWORDS and not c.isdigit()]
+            booking_ref = valid_candidates[0] if valid_candidates else None
+        else:
+            booking_ref = None
+
+        # Cancellation intent priority check (MUST override booking workflow!)
+        if any(w in upper_text for w in [
+            "CANCEL TICKET", "CANCEL MY FLIGHT", "I WANT TO CANCEL", "CANCEL BOOKING",
+            "CANCEL BK-", "CANCEL PNR", "PLEASE CANCEL", "DON'T WANT THIS TICKET",
+            "DON'T WANT MY TICKET", "CANCEL THIS TICKET", "CANCEL IT", "REFUND MY TICKET", "CANCEL",
+            "REMOVE", "DON'T WANT"
+        ]) or active_cancellation_step in ["CANCELLATION_NEED_REFERENCE", "CANCELLATION_SELECT_PASSENGER", "CANCELLATION_CONFIRMATION_PENDING"]:
+            
+            # If user is in middle of booking draft and says "cancel this", it is CANCEL_DRAFT unless a booking_ref/PNR is given or explicitly "cancel ticket"
+            if any(w in upper_text for w in ["CANCEL DRAFT", "START OVER", "RESET"]) or (upper_text in ["CANCEL", "STOP", "DON'T CONTINUE"] and not booking_ref and active_cancellation_step == "CANCELLATION_IDLE"):
+                return TravelIntent(intent_type="CANCEL_DRAFT", booking_reference=booking_ref, is_complete=True)
+
+            # Passenger cancellation target resolution
+            cancel_all = any(w in upper_text for w in ["EVERYONE", "EVERYBODY", "ENTIRE BOOKING", "WHOLE BOOKING", "ALL PASSENGERS", "BOTH PASSENGERS", "CANCEL ALL", "ALL TICKETS"])
+            cancel_idx = None
+            cancel_target = None
+
+            if "FIRST PASSENGER" in upper_text or "FIRST PERSON" in upper_text or "PASSENGER 1" in upper_text or "PERSON 1" in upper_text or "ONLY THE FIRST" in upper_text:
+                cancel_idx = 1
+            elif "SECOND PASSENGER" in upper_text or "SECOND PERSON" in upper_text or "PASSENGER 2" in upper_text or "PERSON 2" in upper_text:
+                cancel_idx = 2
+            elif "THIRD PASSENGER" in upper_text or "THIRD PERSON" in upper_text or "PASSENGER 3" in upper_text or "PERSON 3" in upper_text:
+                cancel_idx = 3
+
+            # Seat matching e.g. "cancel seat 12A" or "cancel 12A"
+            seat_match = re.search(r"\b(?:SEAT\s*)?([0-9]{1,2}[A-F])\b", upper_text)
+            if seat_match:
+                cancel_target = seat_match.group(1)
+
+            # Name matching e.g. "cancel Rahul", "cancel Passenger1", "cancel Rahul's ticket", "remove Rahul"
+            if not cancel_target and not cancel_idx and not cancel_all:
+                name_match = re.search(r"\b(?:CANCEL|REMOVE|DON'T WANT)\s+([A-Za-z0-9_]+(?:\s+[A-Za-z0-9_]+)?)(?:'S|\s+TICKET|\s+FROM)?\b", text, re.IGNORECASE)
+                if name_match:
+                    target_name = name_match.group(1).strip()
+                    if target_name.upper() not in KEYWORDS and target_name.upper() not in CITY_MAP:
+                        cancel_target = target_name
+
+            return TravelIntent(
+                intent_type="CANCEL_BOOKING",
+                booking_reference=booking_ref,
+                cancel_target_passenger=cancel_target,
+                cancel_passenger_index=cancel_idx,
+                cancel_all=cancel_all,
+                is_complete=True
+            )
+
+        # Check explicit conversational actions
+        if any(w in upper_text for w in ["PROCEED TO PAYMENT", "PAY NOW", "PROCEED PAYMENT", "PAY", "CONFIRM PAYMENT"]):
+            return TravelIntent(intent_type="PROCEED_PAYMENT", is_complete=True)
+
+        if upper_text in ["MODIFY", "MODIFY BOOKING", "MODIFY MY BOOKING", "WHAT CAN I CHANGE?", "CHANGE SOMETHING", "I WANT TO MODIFY"] or any(w in upper_text for w in ["MODIFY BOOKING", "WHAT CAN I CHANGE", "MODIFY MY BOOKING"]):
+            return TravelIntent(intent_type="MODIFY", flight_number="MENU", is_complete=True)
+
+        if any(w in upper_text for w in ["CANCEL MODIFICATION", "BACK TO REVIEW", "DON'T MODIFY", "STOP MODIFYING"]):
+            return TravelIntent(intent_type="MODIFY", flight_number="CANCEL_MODIFICATION", is_complete=True)
+
+        if any(w in upper_text for w in ["CHANGE FLIGHT", "SHOW OTHER FLIGHTS", "DIFFERENT FLIGHT", "I WANT ANOTHER FLIGHT", "CHANGE MY FLIGHT"]):
+            return TravelIntent(intent_type="MODIFY", flight_number="CHANGE_FLIGHT", is_complete=True)
+
+        if any(w in upper_text for w in ["CHANGE CLASS", "DIFFERENT CLASS", "CHANGE TRAVEL CLASS"]):
+            return TravelIntent(intent_type="MODIFY", flight_number="CHANGE_CLASS", is_complete=True)
+
+        if any(w in upper_text for w in ["CHANGE SEAT", "CHANGE SEATS", "DIFFERENT SEAT", "CHANGE MY SEATS"]):
+            return TravelIntent(intent_type="MODIFY", flight_number="CHANGE_SEAT", is_complete=True)
+
+        if any(w in upper_text for w in ["CHANGE PASSENGER", "CHANGE PASSENGERS", "CHANGE PASSENGER DETAILS", "MODIFY PASSENGERS", "MODIFY PASSENGER DETAILS"]):
+            return TravelIntent(intent_type="MODIFY", flight_number="CHANGE_PASSENGERS", is_complete=True)
+
+
+        # Check flight selection patterns
+        flt_selection_match = re.search(r"\b(OPTION|FLIGHT|CHOICE|NUMBER)?\s*([1-9]|FIRST|SECOND|THIRD|FOURTH)\b", upper_text)
+        flight_num_match = re.search(r"\b([A-Z]{2}-\d{3})\b", upper_text)
+        flight_number = flight_num_match.group(1) if flight_num_match else None
+
+        # Check seat selection patterns
+        seats_matches = re.findall(r"\b([1-9][0-9]?[A-F]|[A-F][1-9][0-9]?)\b", upper_text)
+        selected_seats = list(set(seats_matches)) if seats_matches else []
+
+        # Check class selection patterns
+        travel_class: Optional[TravelClass] = None
+        if "PREMIUM ECONOMY" in upper_text or "PREMIUM" in upper_text:
+            travel_class = TravelClass.PREMIUM_ECONOMY
+        elif "BUSINESS" in upper_text:
+            travel_class = TravelClass.BUSINESS
+        elif "ECONOMY" in upper_text:
+            travel_class = TravelClass.ECONOMY
+
+        # City extraction
+        source: Optional[str] = None
+        destination: Optional[str] = None
+
+        from_match = re.search(r"\bFROM\s+([A-Z\s]{3,15})\b", upper_text)
+        to_match = re.search(r"\bTO\s+([A-Z\s]{3,15})\b", upper_text)
+
+        def match_city_name(raw_str: str) -> Optional[str]:
+            for word in raw_str.split():
+                clean_w = re.sub(r'[^A-Z]', '', word)
+                if clean_w in CITY_MAP:
+                    return CITY_MAP[clean_w]
+            return None
+
+        if from_match:
+            source = match_city_name(from_match.group(1))
+        if to_match:
+            destination = match_city_name(to_match.group(1))
+
+        found_matches: List[Tuple[int, str]] = []
+        for phrase, code in CITY_MAP.items():
+            pattern = r"\b" + re.escape(phrase) + r"\b"
+            for m in re.finditer(pattern, upper_text):
+                found_matches.append((m.start(), code))
+
+        found_matches.sort(key=lambda x: x[0])
+        ordered_cities = []
+        for _, code in found_matches:
+            if code not in ordered_cities:
+                ordered_cities.append(code)
+
+        if not source and not destination:
+            if len(ordered_cities) >= 2:
+                source, destination = ordered_cities[0], ordered_cities[1]
+            elif len(ordered_cities) == 1:
+                if any(w in upper_text for w in ["TO", "INTO", "FOR"]):
+                    destination = ordered_cities[0]
+                else:
+                    source = ordered_cities[0]
+        elif source and not destination:
+            remaining = [c for c in ordered_cities if c != source]
+            if remaining:
+                destination = remaining[0]
+        elif destination and not source:
+            remaining = [c for c in ordered_cities if c != destination]
+            if remaining:
+                source = remaining[0]
+
+        # Date parsing
+        travel_date: Optional[str] = None
+
+        MONTH_MAP = {
+            "JANUARY": 1, "JAN": 1, "FEBRUARY": 2, "FEB": 2, "MARCH": 3, "MAR": 3,
+            "APRIL": 4, "APR": 4, "MAY": 5, "JUNE": 6, "JUN": 6, "JULY": 7, "JUL": 7,
+            "AUGUST": 8, "AUG": 8, "SEPTEMBER": 9, "SEP": 9, "SEPT": 9, "OCTOBER": 10,
+            "OCT": 10, "NOVEMBER": 11, "NOV": 11, "DECEMBER": 12, "DEC": 12
+        }
+
+        if "DAY AFTER TOMORROW" in upper_text:
+            travel_date = (datetime.now() + timedelta(days=2)).strftime("%Y-%m-%d")
+        elif "TOMORROW" in upper_text:
+            travel_date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+        elif "TODAY" in upper_text:
+            travel_date = datetime.now().strftime("%Y-%m-%d")
+        else:
+            # 1. Month-name patterns e.g. "29 august 2026", "29th August 2026", "August 29 2026", "29 Aug 2026"
+            month_pattern = r"\b(?:(\d{1,2})(?:ST|ND|RD|TH)?\s+([A-Z]{3,9})(?:\s+(\d{4}))?|([A-Z]{3,9})\s+(\d{1,2})(?:ST|ND|RD|TH)?(?:\s+(\d{4}))?)\b"
+            m_date = re.search(month_pattern, upper_text)
+            if m_date:
+                g1, g2, g3, g4, g5, g6 = m_date.groups()
+                day_str = g1 or g5
+                month_str = g2 or g4
+                year_str = g3 or g6 or str(datetime.now().year)
+                if month_str in MONTH_MAP and day_str and day_str.isdigit():
+                    day_num = int(day_str)
+                    month_num = MONTH_MAP[month_str]
+                    year_num = int(year_str)
+                    travel_date = f"{year_num:04d}-{month_num:02d}-{day_num:02d}"
+
+            if not travel_date:
+                d_match = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", text)
+                if not d_match:
+                    d_match_alt = re.search(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b", text)
+                    if d_match_alt:
+                        day, month, year = d_match_alt.group(1), d_match_alt.group(2), d_match_alt.group(3)
+                        travel_date = f"{int(year):04d}-{int(month):02d}-{int(day):02d}"
+                else:
+                    travel_date = d_match.group(1)
+
+        # Number words & phrase dictionary
+        WORD_TO_NUM = {
+            "ONE": 1, "TWO": 2, "THREE": 3, "FOUR": 4, "FIVE": 5,
+            "SIX": 6, "SEVEN": 7, "EIGHT": 8, "NINE": 9, "TEN": 10
+        }
+
+        # Check conversational phrase counts
+        passenger_count: Optional[int] = None
+
+        # 1. First check explicit passenger count regex e.g. "4 tickets", "book 4 tickets", "four passengers"
+        p_match = re.search(
+            r"\b(\d+|ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE|TEN)\s*(?:[A-Za-z]+\s+)*(?:PEOPLE|PASSENGER|PASSENGERS|PERSON|SEAT|SEATS|TICKET|TICKETS|ADULT|ADULTS|MEMBER|MEMBERS)\b",
+            upper_text
+        )
+        if not p_match:
+            p_match = re.search(r"\b(?:BOOK|BUY|RESERVE|NEED|WANT)\s+(\d+|ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE|TEN)\b", upper_text)
+
+        if p_match:
+            raw_p = p_match.group(1)
+            if raw_p in WORD_TO_NUM:
+                passenger_count = WORD_TO_NUM[raw_p]
+            else:
+                try:
+                    passenger_count = int(raw_p)
+                except ValueError:
+                    passenger_count = None
+
+        if not passenger_count:
+            if "JUST ME" in upper_text or "ME ONLY" in upper_text or "SINGLE PASSENGER" in upper_text:
+                passenger_count = 1
+            elif "A COUPLE" in upper_text or "BOTH OF US" in upper_text or "ME AND MY WIFE" in upper_text or "ME AND MY HUSBAND" in upper_text or "TWO OF US" in upper_text:
+                passenger_count = 2
+            elif "THREE OF US" in upper_text or "THERE ARE THREE OF US" in upper_text:
+                passenger_count = 3
+            elif "FOUR OF US" in upper_text or "WE ARE FOUR" in upper_text or "WE ARE 4" in upper_text or "THERE ARE FOUR OF US" in upper_text:
+                passenger_count = 4
+
+        # Mixed-Class / Class Distribution Parsing
+        class_distribution: Dict[str, int] = {}
+        ambiguous_class_count = False
+
+        # Match patterns e.g. "2 economy and 1 business", "two economy and one business", "2 in economy and 1 in business", "2 business + 1 economy"
+        split_matches = re.findall(
+            r"\b(\d+|ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE|TEN)\s*(?:FOR\s*)?(?:TICKETS?\s*(?:IN|FOR)?\s*|SEATS?\s*(?:IN|FOR)?\s*|PEOPLE\s*(?:IN|FOR)?\s*|IN\s*|OF\s*US\s*)?(BUSINESS|BUSINESS\s*CLASS|ECONOMY|ECONOMY\s*CLASS|COACH|STANDARD|PREMIUM\s*ECONOMY|PREMIUM\s*ECONOMY\s*CLASS|PREMIUM)\b",
+            upper_text
+        )
+        for count_str, class_str in split_matches:
+            c_num = WORD_TO_NUM.get(count_str) if count_str in WORD_TO_NUM else (int(count_str) if count_str.isdigit() else 1)
+            norm_c = "PREMIUM_ECONOMY" if "PREMIUM" in class_str else ("BUSINESS" if "BUSINESS" in class_str else "ECONOMY")
+            class_distribution[norm_c] = class_distribution.get(norm_c, 0) + c_num
+
+        # Also check reverse patterns e.g. "economy for 2", "business for 1"
+        reverse_matches = re.findall(
+            r"\b(BUSINESS|BUSINESS\s*CLASS|ECONOMY|ECONOMY\s*CLASS|COACH|STANDARD|PREMIUM\s*ECONOMY|PREMIUM\s*ECONOMY\s*CLASS|PREMIUM)\s*(?:FOR\s*|CLASS\s*FOR\s*)?(\d+|ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE|TEN)\b",
+            upper_text
+        )
+        for class_str, count_str in reverse_matches:
+            c_num = WORD_TO_NUM.get(count_str) if count_str in WORD_TO_NUM else (int(count_str) if count_str.isdigit() else 1)
+            norm_c = "PREMIUM_ECONOMY" if "PREMIUM" in class_str else ("BUSINESS" if "BUSINESS" in class_str else "ECONOMY")
+            if norm_c not in class_distribution:
+                class_distribution[norm_c] = c_num
+
+        total_split = sum(class_distribution.values())
+        if total_split > 0 and not passenger_count:
+            passenger_count = total_split
+
+        # Contextual resolution for "the other two economy", "the rest economy", "remaining ones business"
+        if ("THE REST" in upper_text or "REMAINING" in upper_text or "OTHER" in upper_text) and any(w in upper_text for w in ["ECONOMY", "BUSINESS", "PREMIUM"]):
+            target_c = "PREMIUM_ECONOMY" if "PREMIUM" in upper_text else ("BUSINESS" if "BUSINESS" in upper_text else "ECONOMY")
+            class_distribution["_REMAINING_CLASS_"] = target_c
+
+        # CRITICAL RULE: If multiple classes requested, DO NOT collapse into a single travel_class
+        if len(class_distribution) > 1:
+            travel_class = None
+        elif len(class_distribution) == 1:
+            single_cls = list(class_distribution.keys())[0]
+            travel_class = TravelClass[single_cls] if single_cls in TravelClass.__members__ else TravelClass.ECONOMY
+
+
+        if not passenger_count:
+            p_match = re.search(
+                r"\b(\d+|ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE|TEN)\s*(?:[A-Za-z]+\s+)*(?:PEOPLE|PASSENGER|PASSENGERS|PERSON|SEAT|SEATS|TICKET|TICKETS|ADULT|ADULTS|MEMBER|MEMBERS)\b",
+                upper_text
+            )
+            if not p_match:
+                p_match = re.search(r"\b(?:BOOK|BUY|RESERVE|NEED|WANT)\s+(\d+|ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE|TEN)\b", upper_text)
+
+            if p_match:
+                raw_p = p_match.group(1)
+                if raw_p in WORD_TO_NUM:
+                    passenger_count = WORD_TO_NUM[raw_p]
+                else:
+                    try:
+                        passenger_count = int(raw_p)
+                    except ValueError:
+                        passenger_count = None
+
+        # Check class distribution vs passenger_count match
+        if passenger_count and class_distribution and "_REMAINING_CLASS_" not in class_distribution:
+            dist_sum = sum(class_distribution.values())
+            if dist_sum != passenger_count:
+                ambiguous_class_count = True
+
+        # Passenger-Specific Class Mapping (e.g. "Rahul and Priya business, Anjali economy")
+        passengers_data = []
+        name_class_matches = re.findall(
+            r"\b([A-Za-z]+)\s*(?:AND\s*([A-Za-z]+))?\s*(?:IS|ARE|WANT|WANTS|IN)?\s*(BUSINESS|ECONOMY|PREMIUM\s*ECONOMY|PREMIUM)\b",
+            text, re.IGNORECASE
+        )
+        for match in name_class_matches:
+            c_tag = "PREMIUM_ECONOMY" if "PREMIUM" in match[2].upper() else ("BUSINESS" if "BUSINESS" in match[2].upper() else "ECONOMY")
+            if match[0] and match[0].upper() not in ["BOOK", "FLIGHT", "MAKE", "PUT", "FOR", "TWO", "THREE", "FOUR", "ONE"]:
+                passengers_data.append({"first_name": match[0].capitalize(), "last_name": "", "travel_class": c_tag})
+            if match[1] and match[1].upper() not in ["AND", "CLASS", "TICKET", "FOR"]:
+                passengers_data.append({"first_name": match[1].capitalize(), "last_name": "", "travel_class": c_tag})
+
+        # Passenger details parsing (Full records: Name, Age, Gender)
+        p_lines = text.split("\n")
+        for line in p_lines:
+            line_upper = line.upper()
+            if any(w in line_upper for w in ["PASSENGER", "NAME", "AGE", "FEMALE", "MALE"]) or "," in line:
+                name_m = re.search(r"(?:NAME|PASSENGER\s*\d*:?|FOR)?\s*([A-Za-z]+\s+[A-Za-z]+)", line, re.IGNORECASE)
+                if name_m:
+                    full_name = name_m.group(1).strip()
+                    parts = full_name.split()
+                    if len(parts) >= 2 and parts[0].upper() not in ["BOOK", "FLIGHT", "SEARCH", "CANCEL", "CHECK", "PASSENGER", "NAME", "OPTION", "CHOICE"]:
+                        f_name, l_name = parts[0], " ".join(parts[1:])
+                        age_m = re.search(r"\b(\d{1,2})\b", line)
+                        age = int(age_m.group(1)) if age_m else None
+                        gender = "FEMALE" if "FEMALE" in line_upper else ("MALE" if "MALE" in line_upper else None)
+                        passengers_data.append({
+                            "first_name": f_name,
+                            "last_name": l_name,
+                            "age": age,
+                            "gender": gender
+                        })
+
+        # Natural Seat Preference & Codes
+        seat_pref = None
+        if "WINDOW" in upper_text:
+            seat_pref = "WINDOW"
+        elif "AISLE" in upper_text:
+            seat_pref = "AISLE"
+        elif "EXTRA LEGROOM" in upper_text or "LEGROOM" in upper_text:
+            seat_pref = "EXTRA_LEGROOM"
+
+        # Natural Flight Selection Identifiers (e.g. "cheapest one", "earliest flight", "first flight", "option 2")
+        selected_flight_phrase = None
+        if "CHEAPEST" in upper_text or "LOWEST FARE" in upper_text or "CHEAPEST ONE" in upper_text:
+            selected_flight_phrase = "CHEAPEST"
+        elif "EARLIEST" in upper_text or "MORNING" in upper_text or "FIRST FLIGHT" in upper_text:
+            selected_flight_phrase = "EARLIEST"
+
+
+        # Active State Prioritization Rules
+        if active_step == "NEED_DATE" and travel_date:
+            intent_type = "SEARCH_FLIGHTS"
+            booking_ref = None
+        elif active_step in ["SEARCHING", "FLIGHT_SELECTED"] and (flt_selection_match or flight_number or selected_flight_phrase):
+            intent_type = "SELECT_FLIGHT"
+        elif active_step == "CLASS_SELECTED" and (travel_class or class_distribution):
+            intent_type = "SELECT_CLASS"
+        elif active_step == "SEATS_PENDING" and (selected_seats or seat_pref):
+            intent_type = "SELECT_SEATS"
+        elif active_step == "PASSENGERS_PENDING" and len(passengers_data) > 0:
+            intent_type = "PROVIDE_PASSENGERS"
+        elif booking_ref and not (source and destination) and not flight_number and not selected_seats and len(passengers_data) == 0:
+            if any(w in upper_text for w in ["STATUS", "PNR", "MY TRIPS", "MY BOOKINGS", "CHECK"]):
+                intent_type = "CHECK_STATUS"
+            else:
+                intent_type = "CANCEL_BOOKING"
+        else:
+            # Determine Intent Type
+            intent_type = "GENERAL_QUERY"
+
+            if any(w in upper_text for w in ["CANCEL BOOKING", "CANCEL TICKET", "REFUND", "DELETE BOOKING"]):
+                intent_type = "CANCEL_BOOKING"
+            elif any(w in upper_text for w in ["STATUS", "PNR", "MY TRIPS", "MY BOOKINGS", "CHECK"]):
+                intent_type = "CHECK_STATUS"
+            elif source and destination or travel_date:
+                if any(w in upper_text for w in ["BOOK", "RESERVE", "CONFIRM", "BUY"]):
+                    intent_type = "BOOK_FLIGHT"
+                else:
+                    intent_type = "SEARCH_FLIGHTS"
+            elif flight_number:
+                intent_type = "BOOK_FLIGHT"
+            elif selected_seats:
+                intent_type = "SELECT_SEATS"
+            elif len(passengers_data) > 0:
+                intent_type = "PROVIDE_PASSENGERS"
+            elif flt_selection_match or any(w in upper_text for w in ["SECOND FLIGHT", "FIRST FLIGHT", "OPTION 1", "OPTION 2", "OPTION 3", "CHOICE 1", "CHOICE 2", "FLIGHT 1", "FLIGHT 2", "FLIGHT 3"]):
+                intent_type = "SELECT_FLIGHT"
+            elif travel_class:
+                intent_type = "SELECT_CLASS"
+            elif any(w in upper_text for w in ["BOOK", "RESERVE", "CONFIRM", "BUY"]):
+                intent_type = "BOOK_FLIGHT"
+            elif any(w in upper_text for w in ["FIND", "SEARCH", "SHOW FLIGHTS", "FLIGHT OPTIONS", "FLY"]):
+                intent_type = "SEARCH_FLIGHTS"
+
+
+
+        missing = []
+        if intent_type in ["SEARCH_FLIGHTS", "BOOK_FLIGHT"]:
+            if not source and not flight_number: missing.append("source city")
+            if not destination and not flight_number: missing.append("destination city")
+
+        is_complete = len(missing) == 0
+
+
+        if selected_flight_phrase and not flight_number:
+            flight_number = selected_flight_phrase
+
+        return TravelIntent(
+            intent_type=intent_type,
+            source=source,
+            destination=destination,
+            travel_date=travel_date,
+            passenger_count=passenger_count,
+            travel_class=travel_class,
+            class_distribution=class_distribution,
+            seat_preference=seat_pref,
+            ambiguous_class_count=ambiguous_class_count,
+            booking_reference=booking_ref,
+            flight_number=flight_number,
+            selected_seats=selected_seats,
+            passengers_data=passengers_data,
+            is_complete=is_complete,
+            missing_fields=missing
+        )
+
+
+
