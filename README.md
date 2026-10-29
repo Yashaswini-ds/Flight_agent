@@ -1,3 +1,4 @@
+HEAD
 # FlightAgent - Production-Grade GenAI Flight Ticket Booking Platform
 
 FlightAgent is a full-stack, two-agent GenAI flight booking application designed for high security, modularity, and deterministic business logic.
@@ -98,3 +99,7 @@ pytest
 - [AP2 Payment Protocol Mapping](file:///docs/ap2.md)
 - [Payment & Refund Workflow](file:///docs/payment-flow.md)
 - [REST API Reference](file:///docs/api.md)
+=======
+# Flight_agent
+AI-powered flight booking platform with secure auth, smart booking agents, and a modern full-stack architecture.
+ 692efc7a7ea94d1d38ab3c2855f1b59bc0897a4e
